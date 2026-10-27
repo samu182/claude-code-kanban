@@ -1,0 +1,10 @@
+{
+  "project": "shop-front",
+  "repo_dir": "C:/path/to/shop-front",
+  "github": "owner/shop-front",
+  "plan": {
+    "path": "docs/計画.md",
+    "section": "## 3."
+  },
+  "color": "blue1"
+}

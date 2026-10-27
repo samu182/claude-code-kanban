@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>カンバンの地図</title>
+<!-- 中身は board.py が書く state（/state）を読むだけ。3 秒ごとに見て、組み立て直されたら描き直す -->
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #e6e8ec; --dim: #8a90a0;
+    --todo: #d7dae0; --mine: #4ade80; --wait: #facc15; --decide: #c084fc; --done: #4b5160;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f6f7f9; --panel: #ffffff; --line: #d9dde4; --text: #1d2129; --dim: #687083;
+      --todo: #5b6272; --mine: #16a34a; --wait: #ca8a04; --decide: #9333ea; --done: #b8bec9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 "Segoe UI", "Yu Gothic UI", "Hiragino Sans", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav button { background: none; border: 1px solid var(--line); color: var(--dim); border-radius: 6px;
+               padding: 3px 10px; font: inherit; cursor: pointer; }
+  nav button.on { color: var(--text); border-color: var(--text); }
+  .meta { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .meta.stale { color: var(--wait); }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--dim); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  main { display: grid; grid-template-columns: 1fr 320px; height: calc(100vh - 49px); }
+  #graph { min-height: 300px; }
+  aside { border-left: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 14px 16px; }
+  aside h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin: 14px 0 6px; }
+  aside h2:first-child { margin-top: 0; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer; }
+  .card .t { font-weight: 600; }
+  .card .w { color: var(--dim); font-size: 12px; }
+  .col-自分の番 { border-left: 3px solid var(--mine); }
+  .col-外部待ち { border-left: 3px solid var(--wait); }
+  .col-やること { border-left: 3px solid var(--todo); }
+  .detail .t { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .detail ul { padding-left: 18px; margin: 4px 0; }
+  .detail li.done { color: var(--dim); text-decoration: line-through; }
+  .detail a { color: inherit; }
+  .empty { color: var(--dim); }
+  .errors { color: var(--wait); font-size: 12px; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 60vh auto; height: auto; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>カンバンの地図</h1>
+  <nav id="tabs"></nav>
+  <div class="legend">
+    <span><i style="background:var(--mine)"></i>自分の番</span>
+    <span><i style="background:var(--wait)"></i>外部待ち</span>
+    <span><i style="background:var(--todo)"></i>やること</span>
+    <span><i style="background:var(--decide)"></i>決めること</span>
+    <span><i style="background:var(--done)"></i>済</span>
+    <span>◆ 最初の区切りに要る</span>
+  </div>
+  <div class="meta" id="meta">読み込み中…</div>
+</header>
+<main>
+  <div id="graph" style="position:relative"><p id="noplan" class="empty" style="padding:16px;display:none">このプロジェクトは計画書を持たない（カードは右の一覧）。</p></div>
+  <aside id="side"></aside>
+</main>
+<script>
+const POLL_MS = 3000;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const STATUS_VAR = { "自分の番": "--mine", "外部待ち": "--wait", "やること": "--todo", "決めること": "--decide", "済": "--done" };
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let state = null, current = null, selected = null, lastSig = "", cy = null;
+try { current = localStorage.getItem("map.project"); } catch (e) {}
+
+function projectNames() {
+  const names = new Set([...Object.keys(state.plans || {}), ...state.cards.map(c => c.project)]);
+  return [...names].sort((a, b) => (state.plans?.[b] ? 1 : 0) - (state.plans?.[a] ? 1 : 0) || a.localeCompare(b));
+}
+
+function renderTabs() {
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = projectNames().map(p =>
+    `<button class="${p === current ? "on" : ""}" data-p="${esc(p)}">${esc(p)}</button>`).join("");
+  tabs.querySelectorAll("button").forEach(b => b.onclick = () => {
+    current = b.dataset.p; selected = null;
+    try { localStorage.setItem("map.project", current); } catch (e) {}
+    lastSig = ""; render();
+  });
+}
+
+function elementsFor(project) {
+  const rows = state.plans?.[project] || [];
+  const ids = new Set(rows.map(r => r.id));
+  const els = [];
+  for (const g of [...new Set(rows.map(r => r.group))]) els.push({ data: { id: "g:" + g, label: g }, classes: "group" });
+  for (const r of rows) {
+    els.push({ data: { id: r.id, parent: "g:" + r.group, label: `${r.critical ? "◆" : ""}${r.id}\n${r.title}`,
+                       color: css(STATUS_VAR[r.status] || "--todo"), status: r.status },
+               classes: r.status === "済" ? "done" : "" });
+  }
+  // 計画書に無い番号（「案 X-1」のような本文の中の記号）は矢印にしない
+  for (const r of rows) for (const d of r.deps) if (ids.has(d)) els.push({ data: { id: `${d}->${r.id}`, source: d, target: r.id } });
+  return els;
+}
+
+function drawGraph() {
+  const els = elementsFor(current);
+  if (cy) { cy.destroy(); cy = null; }
+  // 計画書の無いプロジェクトは図を作らず、札だけ出す（入れ物の中身を書き換えると、次の図が描けなくなった）
+  document.getElementById("noplan").style.display = els.length ? "none" : "block";
+  if (!els.length) return;
+  cy = cytoscape({
+    container: document.getElementById("graph"), elements: els, wheelSensitivity: 0.25,
+    style: [
+      { selector: "node", style: {
+          shape: "round-rectangle", "background-color": css("--panel"), "border-width": 2, "border-color": "data(color)",
+          label: "data(label)", color: css("--text"), "font-size": 14, "text-wrap": "wrap", "text-max-width": 190,
+          "text-valign": "center", width: 210, height: 62, padding: 8 } },
+      { selector: "node.done", style: { opacity: 0.45, "border-style": "dashed" } },
+      { selector: "node.group", style: {
+          "background-opacity": 0.04, "background-color": css("--text"), "border-width": 1, "border-color": css("--line"),
+          label: "data(label)", "text-valign": "top", "text-halign": "center", color: css("--dim"), "font-size": 14, padding: 16 } },
+      { selector: "edge", style: {
+          width: 1.5, "line-color": css("--dim"), "target-arrow-color": css("--dim"), "target-arrow-shape": "triangle",
+          "curve-style": "bezier", "arrow-scale": 0.9 } },
+      { selector: ":selected", style: { "border-width": 4 } },
+    ],
+    layout: { name: "dagre", rankDir: "LR", nodeSep: 16, rankSep: 70 },
+  });
+  // 全体が収まる倍率が小さすぎて読めないときは、読める倍率で左上から見せる（ホイールで縮めれば全体が見える）
+  cy.fit(undefined, 24);
+  if (cy.zoom() < 0.7) { cy.zoom(0.7); const b = cy.elements().boundingBox(); cy.pan({ x: 24 - b.x1 * 0.7, y: 24 - b.y1 * 0.7 }); }
+  cy.on("tap", "node", e => { if (!e.target.hasClass("group")) { selected = e.target.id(); renderSide(); } });
+  cy.on("tap", e => { if (e.target === cy) { selected = null; renderSide(); } });
+}
+
+// 位置はそのままで、状態（色）だけ塗り直す。行の増減や依存の変化があれば描き直す
+function updateGraph() {
+  const els = elementsFor(current);
+  const shape = els.map(e => e.data.id + (e.data.parent || "")).sort().join("|");
+  if (!cy || cy.scratch("shape") !== shape) { drawGraph(); if (cy) cy.scratch("shape", shape); return; }
+  for (const e of els) {
+    const n = cy.getElementById(e.data.id);
+    if (n.isNode() && !n.hasClass("group")) { n.data(e.data); n.classes(e.classes || ""); }
+  }
+}
+
+function prLinks(card) {
+  const gh = state.projects?.[card.project]?.github;
+  return (card.prs || []).map(n => gh ? `<a href="https://github.com/${esc(gh)}/pull/${n}" target="_blank">#${n}</a>` : `#${n}`).join(" ");
+}
+
+function cardHtml(c) {
+  const tail = [c.progress, ...(c.why || [])].filter(Boolean).join(" / ");
+  return `<div class="card col-${esc(c.column)}" data-id="${esc(c.id)}">
+    <div class="t">${c.kind === "fix" ? "修正 " : ""}${c.kind === "plan" ? esc(c.id) + " " : ""}${esc(c.title)}</div>
+    <div class="w">${esc(c.column)}${tail ? " — " + esc(tail) : ""}</div></div>`;
+}
+
+function renderSide() {
+  const side = document.getElementById("side");
+  const cards = state.cards.filter(c => c.project === current);
+  let html = "";
+  if (selected) {
+    const row = (state.plans?.[current] || []).find(r => r.id === selected);
+    const card = cards.find(c => c.id === selected);
+    html += `<h2>選んだ項目</h2><div class="detail">`;
+    html += `<div class="t">${row?.critical ? "◆" : ""}${esc(selected)} ${esc(row?.title || card?.title || "")}</div>`;
+    html += `<div>${esc(card?.column || row?.status || "計画書の外")}${row?.card === false ? "（カードにしない節）" : ""}</div>`;
+    if (card?.why?.length) html += `<div class="w">${card.why.map(esc).join(" / ")}</div>`;
+    if (row?.deps?.length) html += `<div>待つもの: ${row.deps.map(esc).join("・")}</div>`;
+    if (card?.prs?.length) html += `<div>PR: ${prLinks(card)}</div>`;
+    if (card?.items?.length) html += `<ul>${card.items.map(i => `<li class="${i.done ? "done" : ""}">${esc(i.text)}</li>`).join("")}</ul>`;
+    if (card?.note) html += `<div class="w">${esc(card.note)}</div>`;
+    html += `</div>`;
+  }
+  const outside = cards.filter(c => c.kind !== "plan");
+  for (const col of ["自分の番", "外部待ち", "やること"]) {
+    const group = (state.plans?.[current] ? outside : cards).filter(c => c.column === col);
+    if (!group.length) continue;
+    html += `<h2>${state.plans?.[current] ? "計画の外 · " : ""}${col}（${group.length}）</h2>` + group.map(cardHtml).join("");
+  }
+  if (!html) html = `<p class="empty">項目を押すと、ここに中身が出る。</p>`;
+  if (state.errors?.length) html += `<h2>読めなかったもの</h2><div class="errors">${state.errors.map(esc).join("<br>")}</div>`;
+  side.innerHTML = html;
+  side.querySelectorAll(".card").forEach(el => el.onclick = () => {
+    selected = el.dataset.id; renderSide();
+    if (cy) { cy.$(":selected").unselect(); cy.getElementById(selected).select(); }
+  });
+}
+
+function render() {
+  if (!state) return;
+  const names = projectNames();
+  if (!names.includes(current)) current = names[0];
+  renderTabs(); updateGraph(); renderSide();
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/state", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    const s = await r.json();
+    const meta = document.getElementById("meta");
+    const at = new Date(s.generated_at);
+    const age = (Date.now() - at) / 60000;
+    meta.textContent = `${at.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })} 時点` + (age > 5 ? `（${Math.round(age)} 分前。カンバンの画面が止まっている？）` : "");
+    meta.classList.toggle("stale", age > 5);
+    if (s.generated_at !== lastSig) { lastSig = s.generated_at; state = s; render(); }
+  } catch (e) {
+    document.getElementById("meta").textContent = "state が読めない（map_server.py は動いている？）";
+  }
+}
+poll(); setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

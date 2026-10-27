@@ -1,0 +1,73 @@
+{
+  "zones": [
+    {
+      "id": "shop",
+      "title": "shop-front",
+      "sub": "Vercel ＋ Postgres",
+      "kind": "project"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "cart",
+      "zone": "shop",
+      "title": "カート",
+      "sub": "商品を入れる",
+      "plan": [
+        "C-2"
+      ],
+      "step": 1
+    },
+    {
+      "id": "mail",
+      "zone": "shop",
+      "title": "注文確定のメール",
+      "sub": "注文が確定したら送る",
+      "plan": [
+        "C-4"
+      ],
+      "paths": [
+        "src/core/orderMail.ts",
+        "src/adapters/mail/sender.ts"
+      ],
+      "docs": [
+        "docs/設計/注文のメール.md"
+      ],
+      "step": 3
+    },
+    {
+      "id": "db",
+      "zone": "shop",
+      "title": "DB",
+      "sub": "注文・在庫",
+      "plan": [
+        "B-1"
+      ],
+      "step": 2
+    }
+  ],
+  "edges": [
+    {
+      "from": "cart",
+      "to": "db",
+      "label": "注文を書く"
+    },
+    {
+      "from": "cart",
+      "to": "api:stock",
+      "label": "在庫を聞く",
+      "check": {
+        "path": "src/adapters/stockClient.ts",
+        "contains": "new StockClient"
+      }
+    },
+    {
+      "from": "mail",
+      "to": "shared:mailer",
+      "label": "送る",
+      "plan": [
+        "C-4"
+      ]
+    }
+  ]
+}
